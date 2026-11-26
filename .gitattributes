@@ -1,0 +1,2 @@
+licenses/*.txt -text
+licenses/Qwen-Image-2.1-Research.txt whitespace=-blank-at-eol

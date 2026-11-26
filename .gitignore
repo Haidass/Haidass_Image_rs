@@ -1,0 +1,10 @@
+/target/
+/models/
+/hf_ref/
+/outputs/
+/dist/
+*.himg
+*.safetensors
+*.pdb
+*.log
+.env*

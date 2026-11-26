@@ -1,0 +1,141 @@
+name: Engine CI
+
+'on':
+  pull_request:
+  push:
+    branches: ['main']
+    tags: ['engine-v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: '-C target-cpu=x86-64'
+  TOOLCHAIN: '1.100.0'
+
+jobs:
+  build:
+    name: Build and test (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            extension: .exe
+            archive: zip
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            extension: ''
+            archive: tar.gz
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      TARGET: ${{ matrix.target }}
+      EXE_EXTENSION: ${{ matrix.extension }}
+      ARCHIVE_EXTENSION: ${{ matrix.archive }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install exact Rust toolchain
+        run: |
+          rustup toolchain install $env:TOOLCHAIN --profile minimal --target $env:TARGET
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          rustc "+$env:TOOLCHAIN" --version --verbose
+      - name: Test
+        run: cargo "+$env:TOOLCHAIN" test --locked --all-targets --target $env:TARGET
+      - name: Build release binaries
+        run: cargo "+$env:TOOLCHAIN" build --locked --release --bins --target $env:TARGET
+      - name: Smoke-test the release executables
+        run: |
+          foreach ($binary in @('haidass-infer', 'haidass-convert')) {
+            $path = Join-Path ($env:CARGO_TARGET_DIR ?? (Join-Path $PWD "target")) "$env:TARGET/release/$binary$env:EXE_EXTENSION"
+            $helpOutput = & $path --help
+            if ($LASTEXITCODE -ne 0 -or ($helpOutput -join "`n") -notmatch 'Usage:') {
+              throw "$binary --help failed"
+            }
+          }
+      - name: Package engine and checksum
+        run: |
+          $metadata = cargo "+$env:TOOLCHAIN" metadata --no-deps --locked --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $package = @($metadata.packages | Where-Object name -eq 'haidass-image-rs')
+          if ($package.Count -ne 1 -or $package[0].version -notmatch '^\d+\.\d+\.\d+$') {
+            throw 'Expected exactly one haidass-image-rs package with a major.minor.patch version'
+          }
+          $version = $package[0].version
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -cne "engine-v$version") {
+            throw 'Engine tag must match the Cargo package version'
+          }
+          $stem = "haidass-image-rs-v$version-$env:TARGET"
+          New-Item -ItemType Directory -Path "staging/$stem", 'dist' | Out-Null
+          $targetDir = $env:CARGO_TARGET_DIR ?? (Join-Path $PWD "target")
+          foreach ($binary in @('haidass-infer', 'haidass-convert', 'haidass-bench')) {
+            Copy-Item -LiteralPath (Join-Path $targetDir "$env:TARGET/release/$binary$env:EXE_EXTENSION") -Destination "staging/$stem"
+          }
+          Copy-Item -LiteralPath 'README.md', 'THIRD_PARTY_NOTICES.md' -Destination "staging/$stem"
+          New-Item -ItemType Directory -Path "staging/$stem/licenses", "staging/$stem/docs" | Out-Null
+          Copy-Item -LiteralPath 'licenses/Apache-2.0.txt' -Destination "staging/$stem/licenses"
+          Copy-Item -LiteralPath 'docs/model-weights.md' -Destination "staging/$stem/docs"
+          foreach ($notice in @('LICENSE', 'LICENSE.md', 'LICENSE.txt', 'NOTICE', 'NOTICE.md', 'NOTICE.txt')) {
+            if (Test-Path -LiteralPath $notice -PathType Leaf) {
+              Copy-Item -LiteralPath $notice -Destination "staging/$stem"
+            }
+          }
+          @("Version: $version", "Source revision: $env:GITHUB_SHA", "Target: $env:TARGET",
+            "Rust toolchain: $env:TOOLCHAIN") | Set-Content "staging/$stem/BUILD-INFO.txt" -Encoding ascii
+          $archive = "$stem.$env:ARCHIVE_EXTENSION"
+          if ($env:ARCHIVE_EXTENSION -eq 'zip') {
+            Compress-Archive -LiteralPath "staging/$stem" -DestinationPath "dist/$archive"
+          } else {
+            tar -czf "dist/$archive" -C staging $stem
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+          $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath "dist/$archive").Hash.ToLowerInvariant()
+          Set-Content -LiteralPath "dist/$archive.sha256" -Value "$digest  $archive`n" -Encoding ascii -NoNewline
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: engine-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: Publish engine release
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'engine-v')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: engine-*
+          path: dist
+          merge-multiple: true
+      - name: Verify and publish engine assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+          GH_PROMPT_DISABLED: '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^engine-v([0-9]+\.[0-9]+\.[0-9]+)$ ]]
+          version="${BASH_REMATCH[1]}"
+          prefix="haidass-image-rs-v$version"
+          linux="$prefix-x86_64-unknown-linux-gnu.tar.gz"
+          windows="$prefix-x86_64-pc-windows-msvc.zip"
+          cd dist
+          sha256sum --check --strict "$linux.sha256" "$windows.sha256"
+          gh release create "$RELEASE_TAG" "$linux" "$linux.sha256" "$windows" "$windows.sha256" \
+            --repo "$GH_REPO" --verify-tag --title "HAIDASS Image Rust Engine $version" --latest \
+            --notes "CPU engine, converter and benchmark for Windows x86-64 and Linux x86-64. These archives contain no model weights; see the project README for supported model sources."

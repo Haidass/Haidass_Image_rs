@@ -1,0 +1,25 @@
+[package]
+name = "haidass-image-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+half = "2.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+memmap2 = "0.9"
+rayon = "1.10"
+regex = "1.11"
+safetensors = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+bytemuck = { version = "1.19", features = ["derive"] }
+anyhow = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
